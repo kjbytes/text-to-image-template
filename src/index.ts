@@ -1,9 +1,10 @@
 const IMAGE_COUNT = 10;
-const FLUX_REF_LIMIT = 4; // ponytail: Workers AI Flux max is 4 refs; extras are vision-summarized. Upgrade: collage/resize into 4 tiles if Cloudflare Images is enabled.
+const FLUX_REF_LIMIT = 4; // Workers AI Flux.2 [dev] max pixel refs per call
+const FLUX_FOLLOW_SLOTS = FLUX_REF_LIMIT - 1; // 1 slot is the previous result; 3 leftover source images per follow-up
+const FLUX_INPUT_MAX = 512; // ponytail: Flux.2 [dev] input tiles are 512x512; intermediates used as next refs stay at 512. Upgrade: resize with Cloudflare Images.
 const MAX_BYTES = 4_000_000;
 const FETCH_MS = 15_000;
-const MODEL = "@cf/black-forest-labs/flux-2-klein-9b";
-const VISION_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
+const MODEL = "@cf/black-forest-labs/flux-2-dev";
 
 const cors = {
 	"access-control-allow-origin": "*",
@@ -101,6 +102,14 @@ export function selfCheck(): void {
 		images: ["http://127.0.0.1/a.png", ...urls.slice(1)],
 	});
 	if (local.ok) throw new Error("localhost URL should fail");
+	if (fluxPassCount(0) !== 1 || fluxPassCount(4) !== 1) throw new Error("<=4 refs is one pass");
+	if (fluxPassCount(6) !== 2) throw new Error("6 refs should be two Flux calls");
+	if (fluxPassCount(10) !== 3) throw new Error("10 refs should be three Flux calls");
+}
+
+export function fluxPassCount(imageCount: number): number {
+	if (imageCount <= FLUX_REF_LIMIT) return 1;
+	return 1 + Math.ceil((imageCount - FLUX_REF_LIMIT) / FLUX_FOLLOW_SLOTS);
 }
 
 selfCheck();
@@ -110,14 +119,6 @@ function json(status: number, data: unknown): Response {
 		status,
 		headers: { "content-type": "application/json", ...cors },
 	});
-}
-
-function toBase64(bytes: Uint8Array): string {
-	let bin = "";
-	for (let i = 0; i < bytes.length; i += 0x8000) {
-		bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-	}
-	return btoa(bin);
 }
 
 function fromBase64(b64: string): Uint8Array {
@@ -151,54 +152,28 @@ async function fetchImage(fetchImpl: typeof fetch, url: string): Promise<Fetched
 	return { bytes: buf, type: imageContentType(buf, type || "image/jpeg") };
 }
 
-async function describeExtras(env: Env, extras: FetchedImage[], prompt: string): Promise<string> {
-	if (extras.length === 0) return "";
-	const content: Array<
-		{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }
-	> = [
-		{
-			type: "text",
-			text: `The user will generate a new image with this instruction: ${prompt}\nThese extra reference photos could not be attached as pixels. Describe their subjects, style, colors, and composition in one short paragraph to include in an image prompt. Reply with only that paragraph.`,
-		},
-	];
-	for (const img of extras) {
-		content.push({
-			type: "image_url",
-			image_url: { url: `data:${img.type};base64,${toBase64(img.bytes)}` },
-		});
-	}
-	const out = await env.AI.run(VISION_MODEL, {
-		messages: [{ role: "user", content }],
-		max_tokens: 300,
-	});
-	return out.response?.trim() ?? "";
+function refPrompt(userPrompt: string, refCount: number, followUp: boolean): string {
+	if (refCount === 0) return userPrompt;
+	const labels = Array.from({ length: refCount }, (_, i) => `image ${i}`).join(", ");
+	if (!followUp) return `${userPrompt}\n\nUse ${labels} as visual references.`;
+	const extra = Array.from({ length: refCount - 1 }, (_, i) => `image ${i + 1}`).join(", ");
+	return `${userPrompt}\n\nImage 0 is the current result. Keep it as the base and incorporate ${extra} as additional visual references.`;
 }
 
-async function generate(env: Env, input: GenerateInput, images: FetchedImage[]): Promise<Uint8Array> {
-	const refs = images.slice(0, FLUX_REF_LIMIT);
-	const extras = images.slice(FLUX_REF_LIMIT);
-	let extraText = "";
-	try {
-		extraText = await describeExtras(env, extras, input.prompt);
-	} catch {
-		// ponytail: vision extras are best-effort; 4 Flux refs still generate
-	}
-
-	const parts = [input.prompt];
-	if (refs.length > 0) {
-		const labels = refs.map((_, i) => `image ${i}`).join(", ");
-		parts.push(`Use ${labels} as visual references.`);
-	}
-	if (extraText) parts.push(`Also incorporate: ${extraText}`);
-
+async function runFlux(
+	env: Env,
+	prompt: string,
+	refs: FetchedImage[],
+	width: number,
+	height: number,
+): Promise<Uint8Array> {
 	const form = new FormData();
-	form.append("prompt", parts.join("\n\n"));
-	form.append("width", String(input.width ?? 1024));
-	form.append("height", String(input.height ?? 1024));
+	form.append("prompt", prompt);
+	form.append("width", String(width));
+	form.append("height", String(height));
 	refs.forEach((img, i) => {
 		form.append(`input_image_${i}`, new Blob([img.bytes], { type: img.type }), `ref${i}`);
 	});
-
 	const packed = new Response(form);
 	const body = packed.body;
 	if (!body) throw new Error("failed to serialize form");
@@ -210,6 +185,42 @@ async function generate(env: Env, input: GenerateInput, images: FetchedImage[]):
 	})) as { image?: string };
 	if (!out.image) throw new Error("model returned no image");
 	return fromBase64(out.image);
+}
+
+async function generate(env: Env, input: GenerateInput, images: FetchedImage[]): Promise<Uint8Array> {
+	const width = input.width ?? 1024;
+	const height = input.height ?? 1024;
+	if (images.length <= FLUX_REF_LIMIT) {
+		return runFlux(env, refPrompt(input.prompt, images.length, false), images, width, height);
+	}
+
+	const midW = Math.min(width, FLUX_INPUT_MAX);
+	const midH = Math.min(height, FLUX_INPUT_MAX);
+	let current = await runFlux(
+		env,
+		refPrompt(input.prompt, FLUX_REF_LIMIT, false),
+		images.slice(0, FLUX_REF_LIMIT),
+		midW,
+		midH,
+	);
+	let rest = images.slice(FLUX_REF_LIMIT);
+	while (rest.length > 0) {
+		const batch = rest.slice(0, FLUX_FOLLOW_SLOTS);
+		rest = rest.slice(FLUX_FOLLOW_SLOTS);
+		const last = rest.length === 0;
+		const refs: FetchedImage[] = [
+			{ bytes: current, type: imageContentType(current, "image/jpeg") },
+			...batch,
+		];
+		current = await runFlux(
+			env,
+			refPrompt(input.prompt, refs.length, true),
+			refs,
+			last ? width : midW,
+			last ? height : midH,
+		);
+	}
+	return current;
 }
 
 export async function handleRequest(
@@ -232,7 +243,7 @@ export async function handleRequest(
 				height: "optional integer 256–1440",
 			},
 			notes: [
-				`Pass 0–${IMAGE_COUNT} image URLs. Workers AI Flux uses up to ${FLUX_REF_LIMIT} as pixel references; any extra URLs are described and folded into the prompt.`,
+				`Pass 0–${IMAGE_COUNT} image URLs. Flux.2 [dev] takes ${FLUX_REF_LIMIT} pixel refs per call; extra images are folded in with follow-up calls (generated image + next leftovers).`,
 			],
 		});
 	}
