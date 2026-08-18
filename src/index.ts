@@ -1,10 +1,12 @@
 const IMAGE_COUNT = 10;
-const FLUX_REF_LIMIT = 4; // Workers AI Flux.2 [dev] max pixel refs per call
+const FLUX_REF_LIMIT = 4;
 const FLUX_FOLLOW_SLOTS = FLUX_REF_LIMIT - 1; // 1 slot is the previous result; 3 leftover source images per follow-up
-const FLUX_INPUT_MAX = 512; // ponytail: Flux.2 [dev] input tiles are 512x512; intermediates used as next refs stay at 512. Upgrade: resize with Cloudflare Images.
+const FLUX_INPUT_MAX = 512; // ponytail: Flux input tiles are 512x512; intermediates used as next refs stay at 512.
+const DEFAULT_SIZE = 512;
+const STEPS = 4; // flux-2-klein-9b is distilled and fixed at 4 steps
 const MAX_BYTES = 4_000_000;
 const FETCH_MS = 15_000;
-const MODEL = "@cf/black-forest-labs/flux-2-dev";
+const MODEL = "@cf/black-forest-labs/flux-2-klein-9b";
 
 const cors = {
 	"access-control-allow-origin": "*",
@@ -171,6 +173,7 @@ async function runFlux(
 	form.append("prompt", prompt);
 	form.append("width", String(width));
 	form.append("height", String(height));
+	form.append("steps", String(STEPS));
 	refs.forEach((img, i) => {
 		form.append(`input_image_${i}`, new Blob([img.bytes], { type: img.type }), `ref${i}`);
 	});
@@ -188,8 +191,8 @@ async function runFlux(
 }
 
 async function generate(env: Env, input: GenerateInput, images: FetchedImage[]): Promise<Uint8Array> {
-	const width = input.width ?? 1024;
-	const height = input.height ?? 1024;
+	const width = input.width ?? DEFAULT_SIZE;
+	const height = input.height ?? DEFAULT_SIZE;
 	if (images.length <= FLUX_REF_LIMIT) {
 		return runFlux(env, refPrompt(input.prompt, images.length, false), images, width, height);
 	}
@@ -239,11 +242,11 @@ export async function handleRequest(
 			body: {
 				prompt: "string",
 				images: `optional string[0–${IMAGE_COUNT}] http(s) image URLs`,
-				width: "optional integer 256–1440",
-				height: "optional integer 256–1440",
+				width: "optional integer 256–1440, default 512",
+				height: "optional integer 256–1440, default 512",
 			},
 			notes: [
-				`Pass 0–${IMAGE_COUNT} image URLs. Flux.2 [dev] takes ${FLUX_REF_LIMIT} pixel refs per call; extra images are folded in with follow-up calls (generated image + next leftovers).`,
+				`Pass 0–${IMAGE_COUNT} image URLs. Flux.2 [klein] 9B takes ${FLUX_REF_LIMIT} pixel refs per call; extra images are folded in with follow-up calls.`,
 			],
 		});
 	}
