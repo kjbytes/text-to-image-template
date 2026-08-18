@@ -55,10 +55,11 @@ export function parseGenerateRequest(
 	if (typeof prompt !== "string" || !prompt.trim()) {
 		return { ok: false, error: "prompt is required" };
 	}
-	if (!Array.isArray(images) || images.length !== IMAGE_COUNT) {
-		return { ok: false, error: `images must be an array of ${IMAGE_COUNT} http(s) URLs` };
-	}
-	if (!images.every((u) => typeof u === "string" && isAllowedImageUrl(u))) {
+	if (images === undefined) {
+		// prompt-only
+	} else if (!Array.isArray(images) || images.length > IMAGE_COUNT) {
+		return { ok: false, error: `images must be an array of 0–${IMAGE_COUNT} http(s) URLs` };
+	} else if (!images.every((u) => typeof u === "string" && isAllowedImageUrl(u))) {
 		return { ok: false, error: "each image must be a public http(s) URL" };
 	}
 	const size = (n: unknown, name: string): number | undefined | { error: string } => {
@@ -76,7 +77,7 @@ export function parseGenerateRequest(
 		ok: true,
 		value: {
 			prompt: prompt.trim(),
-			images: images as string[],
+			images: Array.isArray(images) ? (images as string[]) : [],
 			width: w as number | undefined,
 			height: h as number | undefined,
 		},
@@ -89,8 +90,12 @@ export function selfCheck(): void {
 	if (!ok.ok) throw new Error(ok.error);
 	const empty = parseGenerateRequest({});
 	if (empty.ok) throw new Error("empty body should fail");
+	const none = parseGenerateRequest({ prompt: "x" });
+	if (!none.ok) throw new Error(none.error);
 	const nine = parseGenerateRequest({ prompt: "x", images: urls.slice(0, 9) });
-	if (nine.ok) throw new Error("9 images should fail");
+	if (!nine.ok) throw new Error(nine.error);
+	const eleven = parseGenerateRequest({ prompt: "x", images: [...urls, "https://example.com/x.png"] });
+	if (eleven.ok) throw new Error("11 images should fail");
 	const local = parseGenerateRequest({
 		prompt: "x",
 		images: ["http://127.0.0.1/a.png", ...urls.slice(1)],
@@ -179,10 +184,11 @@ async function generate(env: Env, input: GenerateInput, images: FetchedImage[]):
 		// ponytail: vision extras are best-effort; 4 Flux refs still generate
 	}
 
-	const parts = [
-		input.prompt,
-		`Use image 0, image 1, image 2, and image 3 as visual references.`,
-	];
+	const parts = [input.prompt];
+	if (refs.length > 0) {
+		const labels = refs.map((_, i) => `image ${i}`).join(", ");
+		parts.push(`Use ${labels} as visual references.`);
+	}
 	if (extraText) parts.push(`Also incorporate: ${extraText}`);
 
 	const form = new FormData();
@@ -221,19 +227,18 @@ export async function handleRequest(
 			path: "/",
 			body: {
 				prompt: "string",
-				images: `string[${IMAGE_COUNT}] http(s) image URLs`,
+				images: `optional string[0–${IMAGE_COUNT}] http(s) image URLs`,
 				width: "optional integer 256–1440",
 				height: "optional integer 256–1440",
 			},
 			notes: [
-				`Workers AI Flux accepts ${FLUX_REF_LIMIT} pixel references; the first ${FLUX_REF_LIMIT} URLs are used as those.`,
-				`The remaining ${IMAGE_COUNT - FLUX_REF_LIMIT} are described and folded into the prompt.`,
+				`Pass 0–${IMAGE_COUNT} image URLs. Workers AI Flux uses up to ${FLUX_REF_LIMIT} as pixel references; any extra URLs are described and folded into the prompt.`,
 			],
 		});
 	}
 
 	if (request.method !== "POST") {
-		return json(405, { error: "POST JSON { prompt, images[10] }" });
+		return json(405, { error: "POST JSON { prompt, images? }" });
 	}
 
 	let parsed: unknown;
