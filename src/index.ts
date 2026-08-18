@@ -274,7 +274,10 @@ export async function handleRequest(
 			headers: { "content-type": imageContentType(bytes, "image/jpeg"), ...cors },
 		});
 	} catch (err) {
-		return json(502, { error: err instanceof Error ? err.message : "generation failed" });
+		const message = err instanceof Error ? err.message : "generation failed";
+		console.error("generate failed", message);
+		const quota = /4006|neurons|daily free allocation/i.test(message);
+		return json(quota ? 429 : 502, { error: message });
 	}
 }
 
